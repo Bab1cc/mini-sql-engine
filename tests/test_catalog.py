@@ -37,3 +37,15 @@ def test_get_table(catalog):
 def test_missing_table_raises(catalog):
     with pytest.raises(CatalogError):
         catalog.get_table("orders")
+
+def test_csv_with_bom(tmp_path):
+    # Files saved by Excel/Notepad on Windows often start with an invisible BOM
+    (tmp_path / "users.csv").write_text("id,name\n1,Ana\n", encoding="utf-8-sig")
+    assert Catalog(tmp_path).get_table("users").columns == ["id", "name"]
+
+
+def test_column_names_are_trimmed(tmp_path):
+    (tmp_path / "users.csv").write_text("  id , name\n1,Ana\n", encoding="utf-8")
+    table = Catalog(tmp_path).get_table("users")
+    assert table.columns == ["id", "name"]
+    assert table.rows == [{"id": 1, "name": "Ana"}]

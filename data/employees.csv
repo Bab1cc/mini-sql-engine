@@ -1,9 +1,9 @@
-   id,name,city,age,salary,department_id
-   1,Marko,Belgrade,28,1200,1
-   2,Ana,Novi Sad,34,1500,2
-   3,Jovan,Belgrade,41,2100,1
-   4,Milica,Nis,25,900,3
-   5,Stefan,Belgrade,36,1800,2
-   6,Jelena,Novi Sad,29,1300,1
-   7,Nikola,Nis,45,2400,3
-   8,Ivana,Belgrade,31,1600,2
+id,name,city,age,salary,department_id
+1,Marko,Belgrade,28,1200,1
+2,Ana,Novi Sad,34,1500,2
+3,Jovan,Belgrade,41,2100,1
+4,Milica,Nis,25,900,3
+5,Stefan,Belgrade,36,1800,2
+6,Jelena,Novi Sad,29,1300,1
+7,Nikola,Nis,45,2400,3
+8,Ivana,Belgrade,31,1600,2

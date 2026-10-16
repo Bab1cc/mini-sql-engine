@@ -44,8 +44,10 @@ class Catalog:
             raise CatalogError(f"Table '{name}' does not exist")
 
         rows = []
-        with open(path, newline="", encoding="utf-8") as f:
+        with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
+            # remove accidental spaces around column names, e.g. "  id " -> "id"
+            reader.fieldnames = [name.strip() for name in reader.fieldnames or []]
             columns = reader.fieldnames
             for row in reader:
                 rows.append({col: convert_value(value) for col, value in row.items()})
