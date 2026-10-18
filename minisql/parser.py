@@ -1,5 +1,7 @@
-from minisql.nodes import Column, SelectItem, SelectStatement, Star
+from minisql.nodes import BinaryOp, Column, Literal, SelectItem, SelectStatement, Star, UnaryOp
 from minisql.tokenizer import TokenType, tokenize
+
+COMPARISON_OPERATORS = {"=", "!=", "<", ">", "<=", ">="}
 
 
 class ParseError(Exception):
@@ -50,21 +52,24 @@ class Parser:
     # ---------- Grammar ----------
 
     def parse_select(self):
-        """SELECT <select_list> FROM <table> [LIMIT <number>] [;]"""
+        """SELECT <select_list> FROM <table> [WHERE <expr>] [LIMIT <number>] [;]"""
         self.expect(TokenType.KEYWORD, "SELECT")
         columns = self.parse_select_list()
         self.expect(TokenType.KEYWORD, "FROM")
         table = self.expect(TokenType.IDENTIFIER).value
+
+        where = None
+        if self.match(TokenType.KEYWORD, "WHERE"):
+            where = self.parse_expression()
 
         limit = None
         if self.match(TokenType.KEYWORD, "LIMIT"):
             limit = self.expect(TokenType.NUMBER).value
 
         self.match(TokenType.PUNCTUATION, ";")
-
         self.expect(TokenType.EOF)
 
-        return SelectStatement(columns=columns, table=table, limit=limit)
+        return SelectStatement(columns=columns, table=table, where=where, limit=limit)
 
     def parse_select_list(self):
         """Either * or one or more select items separated by commas."""
@@ -81,6 +86,67 @@ class Parser:
         """A single item in the SELECT list (for now: a column name)."""
         name = self.expect(TokenType.IDENTIFIER).value
         return SelectItem(Column(name))
+
+    # ---------- Expressions (WHERE conditions) ----------
+
+    def parse_expression(self):
+        """Entry point for any expression."""
+        return self.parse_or()
+
+    def parse_or(self):
+        """and_expr (OR and_expr)*   (given as an example)"""
+        left = self.parse_and()
+        while self.match(TokenType.KEYWORD, "OR"):
+            right = self.parse_and()
+            left = BinaryOp("OR", left, right)
+        return left
+
+    def parse_and(self):
+        """not_expr (AND not_expr)*"""
+        left = self.parse_not()
+        while self.match(TokenType.KEYWORD, "AND"):
+            right = self.parse_not()
+            left = BinaryOp("AND", left, right)
+        return left
+
+    def parse_not(self):
+        """NOT not_expr  |  comparison"""
+        if self.match(TokenType.KEYWORD, "NOT"):
+            operand = self.parse_not()
+            return UnaryOp("NOT", operand)
+        return self.parse_comparison()
+
+    def parse_comparison(self):
+        """primary [ (= | != | < | > | <= | >=) primary ]"""
+        left = self.parse_primary()
+        if self.check(TokenType.OPERATOR) and self.peek().value in COMPARISON_OPERATORS:
+            op = self.advance().value
+            right = self.parse_primary()
+            return BinaryOp(op, left, right)
+        return left
+
+    def parse_primary(self):
+        """NUMBER | STRING | IDENTIFIER | ( expression )"""
+        token = self.peek()
+
+        if token.type in (TokenType.NUMBER, TokenType.STRING):
+            self.advance()
+            return Literal(token.value)
+
+        if token.type == TokenType.IDENTIFIER:
+            self.advance()
+            return Column(token.value)
+
+        if self.match(TokenType.PUNCTUATION, "("):
+            expr = self.parse_expression()  # recursion: a whole expression inside the brackets
+            self.expect(TokenType.PUNCTUATION, ")")
+            return expr
+
+        found = token.value if token.type != TokenType.EOF else "end of query"
+        raise ParseError(
+            f"Expected a number, string, identifier, or '(' but found '{found}' "
+            f"at position {token.position}"
+        )
 
 def parse(sql):
     """Turn a SQL string into a SelectStatement."""

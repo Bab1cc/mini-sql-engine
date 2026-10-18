@@ -30,3 +30,23 @@ class SelectStatement:
     group_by: list = field(default_factory=list)
     order_by: list = field(default_factory=list)
     limit: int | None = None
+
+@dataclass
+class Literal:
+    """A constant value: a number or a string, e.g. 30 or 'Belgrade'."""
+    value: int | float | str
+
+
+@dataclass
+class BinaryOp:
+    """An operation with two sides: age > 30, a AND b, a OR b..."""
+    op: str
+    left: object
+    right: object
+
+
+@dataclass
+class UnaryOp:
+    """An operation with one side: NOT ..."""
+    op: str
+    operand: object
