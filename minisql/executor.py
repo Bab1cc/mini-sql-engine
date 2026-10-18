@@ -1,6 +1,7 @@
+import operator
 from dataclasses import dataclass
 
-from minisql.nodes import Star
+from minisql.nodes import BinaryOp, Column, Literal, Star, UnaryOp
 from minisql.parser import parse
 
 
@@ -32,6 +33,84 @@ class Scan(Operator):
     def __iter__(self):
         for row in self.table.rows:
             yield row
+
+# ---------- Evaluating expressions ----------
+
+# Maps each SQL comparison to a Python function, e.g. ">" -> operator.gt(a, b), which means a > b
+COMPARISONS = {
+    "=": operator.eq,
+    "!=": operator.ne,
+    "<": operator.lt,
+    ">": operator.gt,
+    "<=": operator.le,
+    ">=": operator.ge,
+}
+
+
+def sql_and(left, right):
+    """AND with SQL's NULL rules: False wins, then NULL (None), otherwise True."""
+    if left is False or right is False:
+        return False
+    if left is None or right is None:
+        return None
+    return True
+
+
+def sql_or(left, right):
+    """OR with SQL's NULL rules: True wins, then NULL (None), otherwise False."""
+    if left is True or right is True:
+        return True
+    if left is None or right is None:
+        return None
+    return False
+
+
+def evaluate(expr, row):
+    """Compute the value of an expression for one row (a dict of column -> value)."""
+    if isinstance(expr, Literal):
+        return expr.value
+
+    if isinstance(expr, Column):
+        if expr.name not in row:
+            raise ExecutionError(f"Column '{expr.name}' does not exist")
+        return row[expr.name]
+
+    if isinstance(expr, UnaryOp) and expr.op == "NOT":
+        value = evaluate(expr.operand, row)
+        return None if value is None else not value
+
+    if isinstance(expr, BinaryOp):
+        if expr.op == "AND":
+            return sql_and(evaluate(expr.left, row), evaluate(expr.right, row))
+        if expr.op == "OR":
+            return sql_or(evaluate(expr.left, row), evaluate(expr.right, row))
+
+        # Otherwise it is a comparison: =, !=, <, >, <=, >=
+        left = evaluate(expr.left, row)
+        right = evaluate(expr.right, row)
+        if left is None or right is None:
+            return None  # comparing with NULL is unknown
+        if expr.op in COMPARISONS:
+            try:
+                return COMPARISONS[expr.op](left, right)
+            except TypeError:
+                raise ExecutionError(f"Cannot compare {left!r} with {right!r} using '{expr.op}'")
+
+    raise ExecutionError(f"Unsupported expression: {expr}")
+
+
+class Filter(Operator):
+    """Passes through only the rows where the condition is True."""
+
+    def __init__(self, child, condition):
+        self.child = child
+        self.condition = condition
+
+    def __iter__(self):
+        for row in self.child:
+            # NULL (None) and False both drop the row
+            if evaluate(self.condition, row) is True:
+                yield row
 
 
 class Limit(Operator):
@@ -87,6 +166,8 @@ def execute(stmt, catalog):
     columns = resolve_columns(stmt, table)
 
     plan = Scan(table)
+    if stmt.where is not None:
+        plan = Filter(plan, stmt.where)
     if stmt.limit is not None:
         plan = Limit(plan, stmt.limit)
     plan = Project(plan, columns)
