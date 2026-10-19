@@ -1,4 +1,6 @@
-from minisql.nodes import BinaryOp, Column, Literal, SelectItem, SelectStatement, Star, UnaryOp
+from minisql.nodes import (
+    BinaryOp, Column, Literal, OrderItem, SelectItem, SelectStatement, Star, UnaryOp,
+)
 from minisql.tokenizer import TokenType, tokenize
 
 COMPARISON_OPERATORS = {"=", "!=", "<", ">", "<=", ">="}
@@ -62,6 +64,11 @@ class Parser:
         if self.match(TokenType.KEYWORD, "WHERE"):
             where = self.parse_expression()
 
+        order_by = []
+        if self.match(TokenType.KEYWORD, "ORDER"):
+            self.expect(TokenType.KEYWORD, "BY")
+            order_by = self.parse_order_by()
+
         limit = None
         if self.match(TokenType.KEYWORD, "LIMIT"):
             limit = self.expect(TokenType.NUMBER).value
@@ -69,7 +76,7 @@ class Parser:
         self.match(TokenType.PUNCTUATION, ";")
         self.expect(TokenType.EOF)
 
-        return SelectStatement(columns=columns, table=table, where=where, limit=limit)
+        return SelectStatement(columns=columns, table=table, where=where, order_by=order_by, limit=limit)
 
     def parse_select_list(self):
         """Either * or one or more select items separated by commas."""
@@ -88,6 +95,21 @@ class Parser:
         return SelectItem(Column(name))
 
     # ---------- Expressions (WHERE conditions) ----------
+
+    def parse_order_by(self):
+        """order_item (, order_item)*"""
+        items = [self.parse_order_item()]
+        while self.match(TokenType.PUNCTUATION, ","):
+            items.append(self.parse_order_item())
+        return items
+
+    def parse_order_item(self):
+        """expression [ASC | DESC]"""
+        expr = self.parse_expression()
+        if self.match(TokenType.KEYWORD, "DESC"):
+            return OrderItem(expr, descending=True)
+        self.match(TokenType.KEYWORD, "ASC")  # ASC is the default, so just skip it
+        return OrderItem(expr)
 
     def parse_expression(self):
         """Entry point for any expression."""

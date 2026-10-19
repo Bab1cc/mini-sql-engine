@@ -50,3 +50,9 @@ class UnaryOp:
     """An operation with one side: NOT ..."""
     op: str
     operand: object
+
+@dataclass
+class OrderItem:
+    """One item in ORDER BY, e.g. salary DESC."""
+    expr: object
+    descending: bool = False

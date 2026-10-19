@@ -113,6 +113,35 @@ class Filter(Operator):
                 yield row
 
 
+def sort_key(value):
+    """Sort key that puts NULL (None) after every other value."""
+    if value is None:
+        return (1, 0)
+    return (0, value)
+
+
+class Sort(Operator):
+    """Reads ALL rows from the child, sorts them, then passes them on."""
+
+    def __init__(self, child, order_by):
+        self.child = child
+        self.order_by = order_by  # list of OrderItem
+
+    def __iter__(self):
+        rows = list(self.child)
+        try:
+            # sort by the last item first; Python's sort is stable,
+            # so the earlier items end up deciding the final order
+            for item in reversed(self.order_by):
+                rows.sort(
+                    key=lambda row: sort_key(evaluate(item.expr, row)),
+                    reverse=item.descending,
+                )
+        except TypeError:
+            raise ExecutionError("Cannot sort values of different types")
+        yield from rows
+
+
 class Limit(Operator):
     """Passes through only the first `count` rows."""
 
@@ -168,6 +197,8 @@ def execute(stmt, catalog):
     plan = Scan(table)
     if stmt.where is not None:
         plan = Filter(plan, stmt.where)
+    if stmt.order_by:
+        plan = Sort(plan, stmt.order_by)
     if stmt.limit is not None:
         plan = Limit(plan, stmt.limit)
     plan = Project(plan, columns)
