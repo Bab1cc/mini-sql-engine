@@ -1,5 +1,5 @@
 from minisql.nodes import (
-    BinaryOp, Column, Literal, OrderItem, SelectItem, SelectStatement, Star, UnaryOp,
+    BinaryOp, Column, Literal, OrderItem, SelectItem, SelectStatement, Star, UnaryOp, FunctionCall
 )
 from minisql.tokenizer import TokenType, tokenize
 
@@ -90,9 +90,20 @@ class Parser:
         return items
 
     def parse_select_item(self):
-        """A single item in the SELECT list (for now: a column name)."""
-        name = self.expect(TokenType.IDENTIFIER).value
-        return SelectItem(Column(name))
+        """A single item in the SELECT list: any expression."""
+        return SelectItem(self.parse_expression())
+
+    def parse_function_call(self, name):
+        """Called after NAME( has been read: [* | expr (, expr)*] )"""
+        # the tokenizer emits * as an OPERATOR token
+        if self.match(TokenType.OPERATOR, "*"):
+            args = [Star()]
+        else:
+            args = [self.parse_expression()]
+            while self.match(TokenType.PUNCTUATION, ","):
+                args.append(self.parse_expression())
+        self.expect(TokenType.PUNCTUATION, ")")
+        return FunctionCall(name.upper(), args)  # avg(x) and AVG(x) are the same
 
     # ---------- Expressions (WHERE conditions) ----------
 
@@ -157,6 +168,9 @@ class Parser:
 
         if token.type == TokenType.IDENTIFIER:
             self.advance()
+            # NAME( ... ) is a function call, a bare NAME is a column
+            if self.match(TokenType.PUNCTUATION, "("):
+                return self.parse_function_call(token.value)
             return Column(token.value)
 
         if self.match(TokenType.PUNCTUATION, "("):

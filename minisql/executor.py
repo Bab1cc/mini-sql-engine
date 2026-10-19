@@ -1,7 +1,9 @@
 import operator
 from dataclasses import dataclass
 
-from minisql.nodes import BinaryOp, Column, Literal, Star, UnaryOp
+from minisql.nodes import (
+    BinaryOp, Column, FunctionCall, Literal, SelectItem, Star, UnaryOp,
+)
 from minisql.parser import parse
 
 
@@ -96,7 +98,44 @@ def evaluate(expr, row):
             except TypeError:
                 raise ExecutionError(f"Cannot compare {left!r} with {right!r} using '{expr.op}'")
 
+    if isinstance(expr, FunctionCall):
+        raise ExecutionError(f"Function {expr.name} is not supported yet")
+
     raise ExecutionError(f"Unsupported expression: {expr}")
+
+
+def expr_name(expr):
+    """Turn an expression back into text, used as a column header, e.g. 'AVG(salary)'."""
+    if isinstance(expr, Column):
+        return expr.name
+    if isinstance(expr, Star):
+        return "*"
+    if isinstance(expr, Literal):
+        # strings get quotes: 'Nis', numbers don't: 30
+        return repr(expr.value) if isinstance(expr.value, str) else str(expr.value)
+    if isinstance(expr, FunctionCall):
+        return f"{expr.name}({', '.join(expr_name(arg) for arg in expr.args)})"
+    if isinstance(expr, BinaryOp):
+        return f"{expr_name(expr.left)} {expr.op} {expr_name(expr.right)}"
+    if isinstance(expr, UnaryOp):
+        return f"{expr.op} {expr_name(expr.operand)}"
+    return str(expr)
+
+
+def collect_columns(expr):
+    """Return the set of all column names used anywhere inside an expression."""
+    if isinstance(expr, Column):
+        return {expr.name}
+    if isinstance(expr, BinaryOp):
+        return collect_columns(expr.left) | collect_columns(expr.right)
+    if isinstance(expr, UnaryOp):
+        return collect_columns(expr.operand)
+    if isinstance(expr, FunctionCall):
+        names = set()
+        for arg in expr.args:
+            names |= collect_columns(arg)
+        return names
+    return set()  # Literal, Star: no columns
 
 
 class Filter(Operator):
@@ -161,38 +200,43 @@ class Limit(Operator):
 
 
 class Project(Operator):
-    """Turns each row (a dict) into a list with only the requested columns, in order."""
+    """Computes the SELECT expressions for each row."""
 
-    def __init__(self, child, columns):
+    def __init__(self, child, exprs):
         self.child = child
-        self.columns = columns
+        self.exprs = exprs
 
     def __iter__(self):
         for row in self.child:
-            yield [row[col] for col in self.columns]
-        pass
+            yield [evaluate(expr, row) for expr in self.exprs]
 
 
 # ---------- Planning and execution ----------
 
-def resolve_columns(stmt, table):
-    """Return the list of column names the query asks for."""
+def expand_star(stmt, table):
+    """SELECT * -> one SelectItem per table column."""
     if len(stmt.columns) == 1 and isinstance(stmt.columns[0].expr, Star):
-        return list(table.columns)  # a copy, so callers can't change the table's own list
+        return [SelectItem(Column(name)) for name in table.columns]
+    return stmt.columns
 
-    names = []
-    for item in stmt.columns:
-        name = item.expr.name
-        if name not in table.columns:
-            raise ExecutionError(f"Column '{name}' does not exist in table '{table.name}'")
-        names.append(name)
-    return names
+
+def validate_columns(stmt, items, table):
+    """Fail fast: every column used in SELECT, WHERE or ORDER BY must exist."""
+    exprs = [item.expr for item in items]
+    if stmt.where is not None:
+        exprs.append(stmt.where)
+    exprs += [item.expr for item in stmt.order_by]
+    for expr in exprs:
+        for name in collect_columns(expr):
+            if name not in table.columns:
+                raise ExecutionError(f"Column '{name}' does not exist in table '{table.name}'")
 
 
 def execute(stmt, catalog):
     """Build the plan of operators for a SelectStatement and run it."""
     table = catalog.get_table(stmt.table)
-    columns = resolve_columns(stmt, table)
+    items = expand_star(stmt, table)
+    validate_columns(stmt, items, table)
 
     plan = Scan(table)
     if stmt.where is not None:
@@ -201,9 +245,10 @@ def execute(stmt, catalog):
         plan = Sort(plan, stmt.order_by)
     if stmt.limit is not None:
         plan = Limit(plan, stmt.limit)
-    plan = Project(plan, columns)
+    plan = Project(plan, [item.expr for item in items])
 
-    return Result(columns, list(plan))
+    headers = [item.alias or expr_name(item.expr) for item in items]
+    return Result(headers, list(plan))
 
 
 def run(sql, catalog):
