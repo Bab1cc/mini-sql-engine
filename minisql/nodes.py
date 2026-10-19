@@ -56,3 +56,9 @@ class OrderItem:
     """One item in ORDER BY, e.g. salary DESC."""
     expr: object
     descending: bool = False
+
+@dataclass
+class FunctionCall:
+    """A function call, e.g. COUNT(*) or AVG(salary)."""
+    name: str   # always uppercase, e.g. "COUNT"
+    args: list  # e.g. [Star()] for COUNT(*), [Column("salary")] for AVG(salary)
