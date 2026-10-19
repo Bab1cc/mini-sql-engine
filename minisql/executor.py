@@ -116,7 +116,14 @@ def expr_name(expr):
     if isinstance(expr, FunctionCall):
         return f"{expr.name}({', '.join(expr_name(arg) for arg in expr.args)})"
     if isinstance(expr, BinaryOp):
-        return f"{expr_name(expr.left)} {expr.op} {expr_name(expr.right)}"
+        left = expr_name(expr.left)
+        right = expr_name(expr.right)
+        # wrap nested operations in brackets so the text is not ambiguous
+        if isinstance(expr.left, BinaryOp):
+            left = f"({left})"
+        if isinstance(expr.right, BinaryOp):
+            right = f"({right})"
+        return f"{left} {expr.op} {right}"
     if isinstance(expr, UnaryOp):
         return f"{expr.op} {expr_name(expr.operand)}"
     return str(expr)
