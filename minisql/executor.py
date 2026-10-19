@@ -99,7 +99,12 @@ def evaluate(expr, row):
                 raise ExecutionError(f"Cannot compare {left!r} with {right!r} using '{expr.op}'")
 
     if isinstance(expr, FunctionCall):
-        raise ExecutionError(f"Function {expr.name} is not supported yet")
+        # after Aggregate, the row already contains the result under the
+        # function's name, e.g. row["COUNT(*)"]
+        name = expr_name(expr)
+        if name in row:
+            return row[name]
+        raise ExecutionError(f"Aggregate function {name} is not allowed here")
 
     raise ExecutionError(f"Unsupported expression: {expr}")
 
@@ -187,6 +192,155 @@ class Sort(Operator):
             raise ExecutionError("Cannot sort values of different types")
         yield from rows
 
+# ---------- Aggregate functions ----------
+
+class Accumulator:
+    """Base class: sees values one by one, then returns one result."""
+
+    def add(self, value):
+        raise NotImplementedError
+
+    def result(self):
+        raise NotImplementedError
+
+
+class CountStar(Accumulator):
+    """COUNT(*): counts rows, including rows with NULL values."""
+
+    def __init__(self):
+        self.count = 0
+
+    def add(self, value):
+        self.count += 1
+
+    def result(self):
+        return self.count
+
+
+class Sum(Accumulator):
+    """SUM(x): ignores NULL; NULL if there were no values."""
+
+    def __init__(self):
+        self.total = None
+
+    def add(self, value):
+        if value is None:
+            return
+        self.total = value if self.total is None else self.total + value
+
+    def result(self):
+        return self.total
+
+
+class Count(Accumulator):
+    """COUNT(x): counts only non-NULL values."""
+
+    def __init__(self):
+        self.count = 0
+
+    def add(self, value):
+        if value is not None:
+            self.count += 1
+
+    def result(self):
+        return self.count
+
+
+class Avg(Accumulator):
+    """AVG(x): average of non-NULL values; NULL if there were none."""
+
+    def __init__(self):
+        self.total = 0
+        self.count = 0
+
+    def add(self, value):
+        if value is None:
+            return
+        self.total += value
+        self.count += 1
+
+    def result(self):
+        if self.count == 0:
+            return None
+        return self.total / self.count
+
+
+class Min(Accumulator):
+    """MIN(x): smallest non-NULL value; NULL if there were none."""
+
+    def __init__(self):
+        self.value = None
+
+    def add(self, value):
+        if value is not None and (self.value is None or value < self.value):
+            self.value = value
+
+    def result(self):
+        return self.value
+
+
+class Max(Accumulator):
+    """MAX(x): largest non-NULL value; NULL if there were none."""
+
+    def __init__(self):
+        self.value = None
+
+    def add(self, value):
+        if value is not None and (self.value is None or value > self.value):
+            self.value = value
+
+    def result(self):
+        return self.value
+
+AGGREGATES = {"COUNT": Count, "SUM": Sum, "AVG": Avg, "MIN": Min, "MAX": Max}
+
+
+def make_accumulator(call):
+    """Create the right Accumulator for a FunctionCall like COUNT(*) or AVG(salary)."""
+    if call.name not in AGGREGATES:
+        raise ExecutionError(f"Unknown function {call.name}")
+    if len(call.args) != 1:
+        raise ExecutionError(f"{call.name} takes exactly one argument")
+    if isinstance(call.args[0], Star):
+        if call.name != "COUNT":
+            raise ExecutionError(f"{call.name}(*) is not allowed, only COUNT(*)")
+        return CountStar()
+    return AGGREGATES[call.name]()  # look up the class and create an object
+
+
+class Aggregate(Operator):
+    """Groups rows with a hash table and computes aggregate functions for each group."""
+
+    def __init__(self, child, group_by, aggregates):
+        self.child = child
+        self.group_by = group_by      # list of expressions, e.g. [Column("city")]
+        self.aggregates = aggregates  # list of FunctionCall, e.g. [COUNT(*), AVG(salary)]
+
+    def __iter__(self):
+        groups = {}  # key (tuple of GROUP BY values) -> list of accumulators
+
+        for row in self.child:
+            key = tuple(evaluate(expr, row) for expr in self.group_by)
+            if key not in groups:
+                groups[key] = [make_accumulator(call) for call in self.aggregates]
+            for call, acc in zip(self.aggregates, groups[key]):
+                if isinstance(call.args[0], Star):
+                    acc.add(None)  # COUNT(*) only counts rows, the value doesn't matter
+                else:
+                    acc.add(evaluate(call.args[0], row))
+
+        # No GROUP BY and no rows (e.g. SELECT COUNT(*) FROM empty): still one result row
+        if not groups and not self.group_by:
+            groups[()] = [make_accumulator(call) for call in self.aggregates]
+
+        # One output row per group, as a dict: {"city": "Nis", "COUNT(*)": 2, ...}
+        for key, accumulators in groups.items():
+            out = {}
+            for expr, value in zip(self.group_by, key):
+                out[expr_name(expr)] = value
+            for call, acc in zip(self.aggregates, accumulators):
+                out[expr_name(call)] = acc.result()
+            yield out
 
 class Limit(Operator):
     """Passes through only the first `count` rows."""
@@ -226,10 +380,33 @@ def expand_star(stmt, table):
         return [SelectItem(Column(name)) for name in table.columns]
     return stmt.columns
 
+def find_aggregates(items, order_by):
+    """All aggregate function calls used in SELECT and ORDER BY, without duplicates."""
+    found = {}
+    for expr in [item.expr for item in items] + [item.expr for item in order_by]:
+        if isinstance(expr, FunctionCall):
+            found[expr_name(expr)] = expr
+    return list(found.values())
+
+
+def validate_grouping(items, group_by):
+    """In a GROUP BY query, every non-aggregate SELECT item may only use grouped columns."""
+    grouped = {expr_name(expr) for expr in group_by}
+    for item in items:
+        if isinstance(item.expr, FunctionCall):
+            continue
+        if expr_name(item.expr) in grouped:
+            continue  # the exact expression is in GROUP BY, e.g. GROUP BY age > 30
+        missing = collect_columns(item.expr) - grouped
+        if missing:
+            column = sorted(missing)[0]
+            raise ExecutionError(
+                f"Column '{column}' must appear in GROUP BY or be used in an aggregate function"
+            )
 
 def validate_columns(stmt, items, table):
     """Fail fast: every column used in SELECT, WHERE or ORDER BY must exist."""
-    exprs = [item.expr for item in items]
+    exprs = [item.expr for item in items] + list(stmt.group_by)
     if stmt.where is not None:
         exprs.append(stmt.where)
     exprs += [item.expr for item in stmt.order_by]
@@ -245,9 +422,15 @@ def execute(stmt, catalog):
     items = expand_star(stmt, table)
     validate_columns(stmt, items, table)
 
+    aggregates = find_aggregates(items, stmt.order_by)
+    if stmt.group_by or aggregates:
+        validate_grouping(items, stmt.group_by)
+
     plan = Scan(table)
     if stmt.where is not None:
         plan = Filter(plan, stmt.where)
+    if stmt.group_by or aggregates:
+        plan = Aggregate(plan, stmt.group_by, aggregates)
     if stmt.order_by:
         plan = Sort(plan, stmt.order_by)
     if stmt.limit is not None:

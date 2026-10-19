@@ -64,6 +64,11 @@ class Parser:
         if self.match(TokenType.KEYWORD, "WHERE"):
             where = self.parse_expression()
 
+        group_by = []
+        if self.match(TokenType.KEYWORD, "GROUP"):
+            self.expect(TokenType.KEYWORD, "BY")
+            group_by = self.parse_group_by()
+
         order_by = []
         if self.match(TokenType.KEYWORD, "ORDER"):
             self.expect(TokenType.KEYWORD, "BY")
@@ -76,7 +81,7 @@ class Parser:
         self.match(TokenType.PUNCTUATION, ";")
         self.expect(TokenType.EOF)
 
-        return SelectStatement(columns=columns, table=table, where=where, order_by=order_by, limit=limit)
+        return SelectStatement(columns=columns, table=table, where=where, order_by=order_by, limit=limit, group_by=group_by)
 
     def parse_select_list(self):
         """Either * or one or more select items separated by commas."""
@@ -106,6 +111,13 @@ class Parser:
         return FunctionCall(name.upper(), args)  # avg(x) and AVG(x) are the same
 
     # ---------- Expressions (WHERE conditions) ----------
+
+    def parse_group_by(self):
+        """expression (, expression)*"""
+        exprs = [self.parse_expression()]
+        while self.match(TokenType.PUNCTUATION, ","):
+            exprs.append(self.parse_expression())
+        return exprs
 
     def parse_order_by(self):
         """order_item (, order_item)*"""
