@@ -1,9 +1,7 @@
 import operator
 from dataclasses import dataclass
 
-from minisql.nodes import (
-    BinaryOp, Column, FunctionCall, Literal, SelectItem, Star, UnaryOp,
-)
+from minisql.nodes import (BinaryOp, Column, FunctionCall, Literal, SelectItem, Star, UnaryOp,)
 from minisql.parser import parse
 
 
@@ -417,6 +415,8 @@ def validate_columns(stmt, items, table):
 
 
 def execute(stmt, catalog):
+    if stmt.joins:
+        raise ExecutionError("JOIN is not supported yet")  # until step 8b
     """Build the plan of operators for a SelectStatement and run it."""
     table = catalog.get_table(stmt.table)
     items = expand_star(stmt, table)

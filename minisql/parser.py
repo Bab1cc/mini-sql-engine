@@ -1,6 +1,4 @@
-from minisql.nodes import (
-    BinaryOp, Column, Literal, OrderItem, SelectItem, SelectStatement, Star, UnaryOp, FunctionCall
-)
+from minisql.nodes import (BinaryOp, Column, Join, Literal, OrderItem, SelectItem, SelectStatement, Star, UnaryOp, FunctionCall)
 from minisql.tokenizer import TokenType, tokenize
 
 COMPARISON_OPERATORS = {"=", "!=", "<", ">", "<=", ">="}
@@ -58,7 +56,14 @@ class Parser:
         self.expect(TokenType.KEYWORD, "SELECT")
         columns = self.parse_select_list()
         self.expect(TokenType.KEYWORD, "FROM")
-        table = self.expect(TokenType.IDENTIFIER).value
+        table, alias = self.parse_table_ref()
+
+        joins = []
+        while self.match(TokenType.KEYWORD, "JOIN"):
+            join_table, join_alias = self.parse_table_ref()
+            self.expect(TokenType.KEYWORD, "ON")
+            condition = self.parse_expression()
+            joins.append(Join(join_table, join_alias, condition))
 
         where = None
         if self.match(TokenType.KEYWORD, "WHERE"):
@@ -81,7 +86,7 @@ class Parser:
         self.match(TokenType.PUNCTUATION, ";")
         self.expect(TokenType.EOF)
 
-        return SelectStatement(columns=columns, table=table, where=where, order_by=order_by, limit=limit, group_by=group_by)
+        return SelectStatement(columns=columns, table=table, where=where, order_by=order_by, limit=limit, group_by=group_by, alias=alias, joins=joins)
 
     def parse_select_list(self):
         """Either * or one or more select items separated by commas."""
@@ -94,9 +99,24 @@ class Parser:
             items.append(self.parse_select_item())
         return items
 
+    def parse_table_ref(self):
+        """table_name [[AS] alias]   -> returns (name, alias)"""
+        name = self.expect(TokenType.IDENTIFIER).value
+        if self.match(TokenType.KEYWORD, "AS"):
+            # after AS the alias is required
+            return name, self.expect(TokenType.IDENTIFIER).value
+        if self.check(TokenType.IDENTIFIER):
+            # alias without AS: FROM employees e
+            return name, self.advance().value
+        return name, None
+
     def parse_select_item(self):
-        """A single item in the SELECT list: any expression."""
-        return SelectItem(self.parse_expression())
+        """expression [AS alias]"""
+        expr = self.parse_expression()
+        alias = None
+        if self.match(TokenType.KEYWORD, "AS"):
+            alias = self.expect(TokenType.IDENTIFIER).value
+        return SelectItem(expr, alias)
 
     def parse_function_call(self, name):
         """Called after NAME( has been read: [* | expr (, expr)*] )"""
@@ -183,6 +203,10 @@ class Parser:
             # NAME( ... ) is a function call, a bare NAME is a column
             if self.match(TokenType.PUNCTUATION, "("):
                 return self.parse_function_call(token.value)
+            # NAME.COLUMN is a qualified column, e.g. e.name
+            if self.match(TokenType.PUNCTUATION, "."):
+                column_name = self.expect(TokenType.IDENTIFIER).value
+                return Column(column_name, table=token.value)
             return Column(token.value)
 
         if self.match(TokenType.PUNCTUATION, "("):
