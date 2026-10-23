@@ -1,3 +1,4 @@
+from ast import expr
 import operator
 from dataclasses import dataclass
 
@@ -25,14 +26,20 @@ class Operator:
 
 
 class Scan(Operator):
-    """Reads every row of a table (given as an example)."""
+    """Reads every row of a table. Each value is stored twice:
+    under its plain name ("name") and under alias.name ("e.name")."""
 
-    def __init__(self, table):
+    def __init__(self, table, alias=None):
         self.table = table
+        self.alias = alias or table.name
 
     def __iter__(self):
         for row in self.table.rows:
-            yield row
+            out = {}
+            for column, value in row.items():
+                out[column] = value
+                out[f"{self.alias}.{column}"] = value
+            yield out
 
 # ---------- Evaluating expressions ----------
 
@@ -71,9 +78,11 @@ def evaluate(expr, row):
         return expr.value
 
     if isinstance(expr, Column):
-        if expr.name not in row:
-            raise ExecutionError(f"Column '{expr.name}' does not exist")
-        return row[expr.name]
+        # e.name is looked up as "e.name", a bare name as "name"
+        key = f"{expr.table}.{expr.name}" if expr.table else expr.name
+        if key not in row:
+            raise ExecutionError(f"Column '{key}' does not exist")
+        return row[key]
 
     if isinstance(expr, UnaryOp) and expr.op == "NOT":
         value = evaluate(expr.operand, row)
@@ -110,7 +119,7 @@ def evaluate(expr, row):
 def expr_name(expr):
     """Turn an expression back into text, used as a column header, e.g. 'AVG(salary)'."""
     if isinstance(expr, Column):
-        return expr.name
+        return f"{expr.table}.{expr.name}" if expr.table else expr.name
     if isinstance(expr, Star):
         return "*"
     if isinstance(expr, Literal):
@@ -135,7 +144,7 @@ def expr_name(expr):
 def collect_columns(expr):
     """Return the set of all column names used anywhere inside an expression."""
     if isinstance(expr, Column):
-        return {expr.name}
+        return {expr_name(expr)}
     if isinstance(expr, BinaryOp):
         return collect_columns(expr.left) | collect_columns(expr.right)
     if isinstance(expr, UnaryOp):
@@ -340,6 +349,64 @@ class Aggregate(Operator):
                 out[expr_name(call)] = acc.result()
             yield out
 
+class NestedLoopJoin(Operator):
+    """For every left row, check every right row: O(n * m). Works with any condition."""
+
+    def __init__(self, left, right, condition):
+        self.left = left
+        self.right = right
+        self.condition = condition
+
+    def __iter__(self):
+        # read the right side once: it is needed again for every left row,
+        # and an operator can't safely be iterated more than once
+        right_rows = list(self.right)
+        for left_row in self.left:
+            for right_row in right_rows:
+                row = {**left_row, **right_row}  # one dict with the keys of both rows
+                if evaluate(self.condition, row) is True:
+                    yield row
+
+
+class HashJoin(Operator):
+    """Equality join in two phases, O(n + m):
+    build a hash table from the right side, then probe it with each left row."""
+
+    def __init__(self, left, right, left_key, right_key):
+        self.left = left
+        self.right = right
+        self.left_key = left_key    # expression for the left side, e.g. e.department_id
+        self.right_key = right_key  # expression for the right side, e.g. d.id
+
+    def __iter__(self):
+        buckets = {}  # key value -> list of right rows with that value
+        for right_row in self.right:                      # build phase
+            key = evaluate(self.right_key, right_row)
+            if key is None:
+                continue                                  # NULL never matches anything
+            buckets.setdefault(key, []).append(right_row)
+        for left_row in self.left:                        # probe phase
+            key = evaluate(self.left_key, left_row)
+            # a NULL or missing key finds no bucket, so it gives no rows
+            for right_row in buckets.get(key, []):
+                yield {**left_row, **right_row}
+
+
+def make_join(left, left_aliases, right, right_alias, condition):
+    """Choose the join algorithm (a tiny query planner)."""
+    if (
+        isinstance(condition, BinaryOp)
+        and condition.op == "="
+        and isinstance(condition.left, Column)
+        and isinstance(condition.right, Column)
+    ):
+        a, b = condition.left, condition.right
+        if a.table in left_aliases and b.table == right_alias:
+            return HashJoin(left, right, a, b)
+        if b.table in left_aliases and a.table == right_alias:
+            return HashJoin(left, right, b, a)  # ON d.id = e.department_id: swap the sides
+    return NestedLoopJoin(left, right, condition)
+
 class Limit(Operator):
     """Passes through only the first `count` rows."""
 
@@ -372,11 +439,53 @@ class Project(Operator):
 
 # ---------- Planning and execution ----------
 
-def expand_star(stmt, table):
-    """SELECT * -> one SelectItem per table column."""
+def expand_star(stmt, scope):
+    """SELECT * -> one SelectItem per column of every table in the query."""
     if len(stmt.columns) == 1 and isinstance(stmt.columns[0].expr, Star):
-        return [SelectItem(Column(name)) for name in table.columns]
+        if len(scope) == 1:
+            table = next(iter(scope.values()))
+            return [SelectItem(Column(name)) for name in table.columns]
+        return [
+            SelectItem(Column(name, table=alias))
+            for alias, table in scope.items()
+            for name in table.columns
+        ]
     return stmt.columns
+
+def column_refs(expr):
+    """All Column nodes inside an expression (like collect_columns, but keeps the nodes)."""
+    if isinstance(expr, Column):
+        return [expr]
+    if isinstance(expr, BinaryOp):
+        return column_refs(expr.left) + column_refs(expr.right)
+    if isinstance(expr, UnaryOp):
+        return column_refs(expr.operand)
+    if isinstance(expr, FunctionCall):
+        refs = []
+        for arg in expr.args:
+            refs += column_refs(arg)
+        return refs
+    return []
+
+
+def check_column(column, scope):
+    """scope maps alias -> Table. Checks that a column exists and is not ambiguous."""
+    if column.table is not None:
+        if column.table not in scope:
+            raise ExecutionError(f"Unknown table or alias '{column.table}'")
+        if column.name not in scope[column.table].columns:
+            raise ExecutionError(f"Column '{column.table}.{column.name}' does not exist")
+        return
+    owners = [alias for alias, table in scope.items() if column.name in table.columns]
+    if not owners:
+        if len(scope) == 1:
+            table = next(iter(scope.values()))
+            raise ExecutionError(f"Column '{column.name}' does not exist in table '{table.name}'")
+        raise ExecutionError(f"Column '{column.name}' does not exist")
+    if len(owners) > 1:
+        raise ExecutionError(
+            f"Column '{column.name}' is ambiguous: it exists in {', '.join(owners)}"
+        )
 
 def find_aggregates(items, order_by):
     """All aggregate function calls used in SELECT and ORDER BY, without duplicates."""
@@ -402,31 +511,48 @@ def validate_grouping(items, group_by):
                 f"Column '{column}' must appear in GROUP BY or be used in an aggregate function"
             )
 
-def validate_columns(stmt, items, table):
-    """Fail fast: every column used in SELECT, WHERE or ORDER BY must exist."""
+def validate_columns(stmt, items, scope):
+    """Fail fast: check every column used anywhere in the query."""
     exprs = [item.expr for item in items] + list(stmt.group_by)
+    exprs += [join.condition for join in stmt.joins]
     if stmt.where is not None:
         exprs.append(stmt.where)
     exprs += [item.expr for item in stmt.order_by]
     for expr in exprs:
-        for name in collect_columns(expr):
-            if name not in table.columns:
-                raise ExecutionError(f"Column '{name}' does not exist in table '{table.name}'")
+        for column in column_refs(expr):
+            check_column(column, scope)
 
+def header(item):
+    """Column header: the alias, or the bare column name (e.name -> name), or the expression."""
+    if item.alias:
+        return item.alias
+    if isinstance(item.expr, Column):
+        return item.expr.name
+    return expr_name(item.expr)
 
 def execute(stmt, catalog):
-    if stmt.joins:
-        raise ExecutionError("JOIN is not supported yet")  # until step 8b
     """Build the plan of operators for a SelectStatement and run it."""
     table = catalog.get_table(stmt.table)
-    items = expand_star(stmt, table)
-    validate_columns(stmt, items, table)
+    alias = stmt.alias or stmt.table
+    scope = {alias: table}  # alias -> Table, for every table in the query
+    plan = Scan(table, alias)
+
+    for join in stmt.joins:
+        join_table = catalog.get_table(join.table)
+        join_alias = join.alias or join.table
+        if join_alias in scope:
+            raise ExecutionError(f"Table alias '{join_alias}' is used more than once")
+        left_aliases = set(scope)
+        scope[join_alias] = join_table
+        plan = make_join(plan, left_aliases, Scan(join_table, join_alias), join_alias, join.condition)
+
+    items = expand_star(stmt, scope)
+    validate_columns(stmt, items, scope)
 
     aggregates = find_aggregates(items, stmt.order_by)
     if stmt.group_by or aggregates:
         validate_grouping(items, stmt.group_by)
 
-    plan = Scan(table)
     if stmt.where is not None:
         plan = Filter(plan, stmt.where)
     if stmt.group_by or aggregates:
@@ -437,8 +563,7 @@ def execute(stmt, catalog):
         plan = Limit(plan, stmt.limit)
     plan = Project(plan, [item.expr for item in items])
 
-    headers = [item.alias or expr_name(item.expr) for item in items]
-    return Result(headers, list(plan))
+    return Result([header(item) for item in items], list(plan))
 
 
 def run(sql, catalog):
