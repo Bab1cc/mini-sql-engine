@@ -59,11 +59,14 @@ class Parser:
         table, alias = self.parse_table_ref()
 
         joins = []
-        while self.match(TokenType.KEYWORD, "JOIN"):
+        while True:
+            kind = self.parse_join_kind()
+            if kind is None:
+                break  # no more joins
             join_table, join_alias = self.parse_table_ref()
             self.expect(TokenType.KEYWORD, "ON")
             condition = self.parse_expression()
-            joins.append(Join(join_table, join_alias, condition))
+            joins.append(Join(join_table, join_alias, condition, kind))
 
         where = None
         if self.match(TokenType.KEYWORD, "WHERE"):
@@ -109,6 +112,19 @@ class Parser:
             # alias without AS: FROM employees e
             return name, self.advance().value
         return name, None
+
+    def parse_join_kind(self):
+        """JOIN | INNER JOIN | LEFT [OUTER] JOIN  -> "INNER" / "LEFT", or None if no join follows"""
+        if self.match(TokenType.KEYWORD, "JOIN"):
+            return "INNER"
+        if self.match(TokenType.KEYWORD, "INNER"):
+            self.expect(TokenType.KEYWORD, "JOIN")
+            return "INNER"
+        if self.match(TokenType.KEYWORD, "LEFT"):
+            self.match(TokenType.KEYWORD, "OUTER")  # OUTER is optional, LEFT JOIN = LEFT OUTER JOIN
+            self.expect(TokenType.KEYWORD, "JOIN")
+            return "LEFT"
+        return None
 
     def parse_select_item(self):
         """expression [AS alias]"""
@@ -184,6 +200,10 @@ class Parser:
     def parse_comparison(self):
         """primary [ (= | != | < | > | <= | >=) primary ]"""
         left = self.parse_primary()
+        if self.match(TokenType.KEYWORD, "IS"):
+            negated = self.match(TokenType.KEYWORD, "NOT")  # True if there was a NOT
+            self.expect(TokenType.KEYWORD, "NULL")
+            return UnaryOp("IS NOT NULL" if negated else "IS NULL", left)
         if self.check(TokenType.OPERATOR) and self.peek().value in COMPARISON_OPERATORS:
             op = self.advance().value
             right = self.parse_primary()
@@ -193,6 +213,8 @@ class Parser:
     def parse_primary(self):
         """NUMBER | STRING | IDENTIFIER | ( expression )"""
         token = self.peek()
+        if self.match(TokenType.KEYWORD, "NULL"):
+            return Literal(None)
 
         if token.type in (TokenType.NUMBER, TokenType.STRING):
             self.advance()

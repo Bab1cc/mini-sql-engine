@@ -71,3 +71,4 @@ class Join:
     table: str
     alias: str | None
     condition: object
+    kind: str = "INNER"  # "INNER" or "LEFT"

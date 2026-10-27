@@ -41,6 +41,13 @@ class Scan(Operator):
                 out[f"{self.alias}.{column}"] = value
             yield out
 
+    def null_row(self):
+        """A row of this table where every value is NULL, used by LEFT JOIN."""
+        row = {}
+        for column in self.table.columns:
+            row[column] = None
+            row[f"{self.alias}.{column}"] = None
+        return row
 # ---------- Evaluating expressions ----------
 
 # Maps each SQL comparison to a Python function, e.g. ">" -> operator.gt(a, b), which means a > b
@@ -84,6 +91,12 @@ def evaluate(expr, row):
             raise ExecutionError(f"Column '{key}' does not exist")
         return row[key]
 
+    # IS NULL / IS NOT NULL are never NULL themselves: always True or False
+    if isinstance(expr, UnaryOp) and expr.op == "IS NULL":
+        return evaluate(expr.operand, row) is None
+    if isinstance(expr, UnaryOp) and expr.op == "IS NOT NULL":
+        return evaluate(expr.operand, row) is not None
+
     if isinstance(expr, UnaryOp) and expr.op == "NOT":
         value = evaluate(expr.operand, row)
         return None if value is None else not value
@@ -123,7 +136,8 @@ def expr_name(expr):
     if isinstance(expr, Star):
         return "*"
     if isinstance(expr, Literal):
-        # strings get quotes: 'Nis', numbers don't: 30
+        if expr.value is None:
+            return "NULL"
         return repr(expr.value) if isinstance(expr.value, str) else str(expr.value)
     if isinstance(expr, FunctionCall):
         return f"{expr.name}({', '.join(expr_name(arg) for arg in expr.args)})"
@@ -137,8 +151,9 @@ def expr_name(expr):
             right = f"({right})"
         return f"{left} {expr.op} {right}"
     if isinstance(expr, UnaryOp):
-        return f"{expr.op} {expr_name(expr.operand)}"
-    return str(expr)
+        if expr.op in ("IS NULL", "IS NOT NULL"):
+            return f"{expr_name(expr.operand)} {expr.op}"
+    return f"{expr.op} {expr_name(expr.operand)}"
 
 
 def collect_columns(expr):
@@ -352,31 +367,40 @@ class Aggregate(Operator):
 class NestedLoopJoin(Operator):
     """For every left row, check every right row: O(n * m). Works with any condition."""
 
-    def __init__(self, left, right, condition):
+    def __init__(self, left, right, condition, kind="INNER", null_row=None):
         self.left = left
         self.right = right
         self.condition = condition
+        self.kind = kind
+        self.null_row = null_row or {}
 
     def __iter__(self):
         # read the right side once: it is needed again for every left row,
         # and an operator can't safely be iterated more than once
         right_rows = list(self.right)
         for left_row in self.left:
+            matched = False
             for right_row in right_rows:
                 row = {**left_row, **right_row}  # one dict with the keys of both rows
                 if evaluate(self.condition, row) is True:
+                    matched = True
                     yield row
+            # LEFT JOIN: a left row without any match is kept, with NULLs on the right
+            if not matched and self.kind == "LEFT":
+                yield {**left_row, **self.null_row}
 
 
 class HashJoin(Operator):
     """Equality join in two phases, O(n + m):
     build a hash table from the right side, then probe it with each left row."""
 
-    def __init__(self, left, right, left_key, right_key):
+    def __init__(self, left, right, left_key, right_key, kind="INNER", null_row=None):
         self.left = left
         self.right = right
-        self.left_key = left_key    # expression for the left side, e.g. e.department_id
-        self.right_key = right_key  # expression for the right side, e.g. d.id
+        self.left_key = left_key
+        self.right_key = right_key
+        self.kind = kind
+        self.null_row = null_row or {}
 
     def __iter__(self):
         buckets = {}  # key value -> list of right rows with that value
@@ -388,12 +412,17 @@ class HashJoin(Operator):
         for left_row in self.left:                        # probe phase
             key = evaluate(self.left_key, left_row)
             # a NULL or missing key finds no bucket, so it gives no rows
-            for right_row in buckets.get(key, []):
+            matches = buckets.get(key, [])
+            for right_row in matches:
                 yield {**left_row, **right_row}
+            # an empty list is False, so "not matches" means "no pairs"
+            if not matches and self.kind == "LEFT":
+                yield {**left_row, **self.null_row}
 
 
-def make_join(left, left_aliases, right, right_alias, condition):
+def make_join(left, left_aliases, right, right_alias, condition, kind="INNER"):
     """Choose the join algorithm (a tiny query planner)."""
+    null_row = right.null_row()  # the right side is always a Scan
     if (
         isinstance(condition, BinaryOp)
         and condition.op == "="
@@ -402,10 +431,10 @@ def make_join(left, left_aliases, right, right_alias, condition):
     ):
         a, b = condition.left, condition.right
         if a.table in left_aliases and b.table == right_alias:
-            return HashJoin(left, right, a, b)
+            return HashJoin(left, right, a, b, kind, null_row)
         if b.table in left_aliases and a.table == right_alias:
-            return HashJoin(left, right, b, a)  # ON d.id = e.department_id: swap the sides
-    return NestedLoopJoin(left, right, condition)
+            return HashJoin(left, right, b, a, kind, null_row)
+    return NestedLoopJoin(left, right, condition, kind, null_row)
 
 class Limit(Operator):
     """Passes through only the first `count` rows."""
@@ -537,6 +566,7 @@ def execute(stmt, catalog):
     scope = {alias: table}  # alias -> Table, for every table in the query
     plan = Scan(table, alias)
 
+
     for join in stmt.joins:
         join_table = catalog.get_table(join.table)
         join_alias = join.alias or join.table
@@ -544,7 +574,9 @@ def execute(stmt, catalog):
             raise ExecutionError(f"Table alias '{join_alias}' is used more than once")
         left_aliases = set(scope)
         scope[join_alias] = join_table
-        plan = make_join(plan, left_aliases, Scan(join_table, join_alias), join_alias, join.condition)
+        plan = make_join(
+            plan, left_aliases, Scan(join_table, join_alias), join_alias, join.condition, join.kind
+        )
 
     items = expand_star(stmt, scope)
     validate_columns(stmt, items, scope)
