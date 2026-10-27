@@ -30,6 +30,8 @@ class SelectStatement:
     group_by: list = field(default_factory=list)
     order_by: list = field(default_factory=list)
     limit: int | None = None
+    alias: str | None = None                   # table alias: FROM employees e
+    joins: list = field(default_factory=list)  # list of Join
 
 @dataclass
 class Literal:
@@ -56,3 +58,17 @@ class OrderItem:
     """One item in ORDER BY, e.g. salary DESC."""
     expr: object
     descending: bool = False
+
+@dataclass
+class FunctionCall:
+    """A function call, e.g. COUNT(*) or AVG(salary)."""
+    name: str   # always uppercase, e.g. "COUNT"
+    args: list  # e.g. [Star()] for COUNT(*), [Column("salary")] for AVG(salary)
+
+@dataclass
+class Join:
+    """JOIN <table> [alias] ON <condition>"""
+    table: str
+    alias: str | None
+    condition: object
+    kind: str = "INNER"  # "INNER" or "LEFT"

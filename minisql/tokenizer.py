@@ -11,10 +11,10 @@ class TokenType(Enum):
     PUNCTUATION = auto()
     EOF = auto()  # end of input
 
-
 KEYWORDS = {
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "GROUP", "BY",
     "ORDER", "ASC", "DESC", "LIMIT", "AS", "JOIN", "ON",
+    "INNER", "LEFT", "OUTER", "IS", "NULL",
 }
 OPERATORS = {"=", "!=", "<", ">", "<=", ">=", "+", "-", "*", "/"}
 PUNCTUATION = {",", "(", ")", ";", "."}

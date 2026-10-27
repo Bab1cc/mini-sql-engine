@@ -32,7 +32,7 @@ def test_missing_from_raises():
 
 def test_trailing_garbage_raises():
     with pytest.raises(ParseError):
-        parse("SELECT name FROM users extra")
+        parse("SELECT name FROM users u extra")
 
 
 def test_missing_column_after_comma_raises():
